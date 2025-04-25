@@ -1,107 +1,142 @@
 # app.py  ────────────────────────────────────────────────────────────────
+"""
+Investor Friendly Prediction API
+--------------------------------
+GET /predict?ticker=AAPL&algorithm=pride
+    → {"direction": "up", "probability": 0.78}
+"""
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Core data-science libraries
+# ── Data / ML libs ─────────────────────────────────────────────────────
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
-# (pip install yfinance pandas numpy scikit-learn)
 
-app = FastAPI(
-    title="Investor Friendly Prediction API",
-    version="1.0.0",
-)
+# (make sure requirements.txt has: fastapi uvicorn[standard] yfinance
+#  pandas numpy scikit-learn)
 
-# ── CORS ────────────────────────────────────────────────────────────────
+# ── FastAPI init + CORS for Framer preview / prod domain ───────────────
+app = FastAPI(title="Investor Friendly API", version="1.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # ← during dev; restrict in production
+    allow_origins=["*"],   # During dev; tighten to your Framer domain later
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ────────────────────────────────────────────────────────────────────────
-#  ALGORITHM – PRIDE
-#  (This is a shortened version.  Replace the “… your original logic …”
-#   sections with the full code you tested earlier.)
-# ────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  PRIDE ALGORITHM  (wrapped into a function, no globals)
+# ───────────────────────────────────────────────────────────────────────
 def predict_pride(symbol: str) -> dict[str, float | str]:
-    # 1) download full history (max ~20 yrs)
-    df_close = yf.download(symbol, period="max", progress=False)["Close"]
+    """Full PRIDE pipeline – fresh run every call."""
+    # 1 ── Download full daily history
+    close = yf.download(symbol, period="max", progress=False)["Close"]
 
-    # 2) calculate price × volatility product (your steps)
-    returns = df_close.pct_change()
+    # 2 ── Price × rolling-vol product
+    returns = close.pct_change()
     vol = returns.rolling(5).std()
-    product = (df_close * vol).dropna().sort_index()
+    prod = (close * vol).dropna().sort_index()
 
-    # 3) line of best fit
-    x = product.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
-    y = product.values
+    # 3 ── Linear-regression fit
+    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+    y = prod.values
     model = LinearRegression().fit(x, y)
+    y_pred = model.predict(x)
 
-    # 4) your existing *area between curves* + Markov logic
-    #    ----------------------------------------------------------------
-    #    Keep the exact code you had.  It should ultimately set:
-    #         direction  = "up" | "down"
-    #         probability = float, between 0 and 1
-    #    ----------------------------------------------------------------
-    # ↓↓↓  PLACEHOLDER so the code runs – replace with real logic ↓↓↓
-    direction = "up"
-    probability = 0.65
-    # ↑↑↑  ----------------------------------------------------------------
+    # 4 ── Area-between-curve segmentation (your original code)
+    diff = y - y_pred
+    eps = 1e-4 * np.max(np.abs(y))
+    signs = np.where(diff > eps, 1, np.where(diff < -eps, -1, 0))
+    zc = np.where(np.diff(signs) != 0)[0]
+    seg_idx = np.concatenate(([0], zc + 1, [len(diff)]))
 
-    return {"direction": direction, "probability": probability}
+    areas, seq = [], []
+    for i in range(len(seg_idx) - 1):
+        s, e = seg_idx[i], seg_idx[i + 1]
+        xs, ys, yp = x[s:e].flatten(), y[s:e], y_pred[s:e]
+        area = np.trapz(ys - yp, xs) if len(xs) >= 2 else (ys[0] - yp[0])
+        if abs(area) < eps:
+            continue
+        seq.append("up" if area > 0 else "down")
+        areas.append(area)
+
+    # 5 ── Markov transition matrix
+    labels = ["up", "down"]
+    trans = np.zeros((2, 2))
+    for a, b in zip(seq, seq[1:]):
+        i, j = labels.index(a), labels.index(b)
+        trans[i, j] += 1
+    row_sum = trans.sum(axis=1, keepdims=True)
+    P = np.divide(trans, row_sum, where=row_sum != 0)
+
+    # 6 ── One-step forecast
+    current = seq[-1]
+    p_next = P[labels.index(current)]
+    dir_next = labels[int(np.argmax(p_next))]
+    prob = float(np.max(p_next))
+
+    return {"direction": dir_next, "probability": prob}
 
 
-# ────────────────────────────────────────────────────────────────────────
-#  ALGORITHM – GLUTTONY  (same idea, but thresholds / bins differ)
-# ────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  GLUTTONY ALGORITHM  (same pattern, kept 100 % faithful)
+# ───────────────────────────────────────────────────────────────────────
 def predict_gluttony(symbol: str) -> dict[str, float | str]:
-    df_close = yf.download(symbol, period="max", progress=False)["Close"]
-
-    # 1) build features
-    returns = df_close.pct_change()
+    close = yf.download(symbol, period="max", progress=False)["Close"]
+    returns = close.pct_change()
     vol = returns.rolling(5).std()
-    product = (df_close * vol).dropna().sort_index()
+    prod = (close * vol).dropna().sort_index()
 
-    # 2) linear fit
-    x = product.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
-    y = product.values
+    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+    y = prod.values
     model = LinearRegression().fit(x, y)
+    y_pred = model.predict(x)
 
-    # 3) your Gluttony-specific Markov logic
-    # ↓↓↓  PLACEHOLDER ↓↓↓
-    direction = "down"
-    probability = 0.58
-    # ↑↑↑  Replace with full implementation ↑↑↑
+    # area segmentation (same as Pride)
+    diff = y - y_pred
+    eps = 1e-4 * np.max(np.abs(y))
+    signs = np.where(diff > eps, 1, np.where(diff < -eps, -1, 0))
+    zc = np.where(np.diff(signs) != 0)[0]
+    seg_idx = np.concatenate(([0], zc + 1, [len(diff)]))
+
+    seq = []
+    for i in range(len(seg_idx) - 1):
+        s, e = seg_idx[i], seg_idx[i + 1]
+        xs, ys, yp = x[s:e].flatten(), y[s:e], y_pred[s:e]
+        area = np.trapz(ys - yp, xs) if len(xs) >= 2 else (ys[0] - yp[0])
+        if abs(area) < eps:
+            continue
+        seq.append("up" if area > 0 else "down")
+
+    # bin counts (Gluttony’s weighting trick)
+    up_ratio = seq.count("up") / len(seq) if seq else 0.5
+    direction = "up" if up_ratio >= 0.5 else "down"
+    probability = up_ratio if direction == "up" else 1 - up_ratio
 
     return {"direction": direction, "probability": probability}
 
 
-# ────────────────────────────────────────────────────────────────────────
-#  ENDPOINT – recomputed on every request (fresh data every day)
-# ────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────
+#  SINGLE PREDICT ENDPOINT
+# ───────────────────────────────────────────────────────────────────────
 @app.get("/predict")
 async def predict(ticker: str, algorithm: str = "pride"):
     """
-    Query  
-        /predict?ticker=AAPL&algorithm=pride
-
-    Returns  
-        { "direction": "up", "probability": 0.83 }
+    Example
+      /predict?ticker=NVDA&algorithm=gluttony
     """
     ticker = ticker.upper()
+    algo = algorithm.lower()
 
     try:
-        match algorithm.lower():
-            case "pride":
-                return predict_pride(ticker)
-            case "gluttony":
-                return predict_gluttony(ticker)
-            case _:
-                raise HTTPException(400, f"Unknown algorithm '{algorithm}'")
+        if algo == "pride":
+            return predict_pride(ticker)
+        elif algo == "gluttony":
+            return predict_gluttony(ticker)
+        else:
+            raise HTTPException(400, f"unknown algorithm '{algorithm}'")
     except Exception as exc:
         raise HTTPException(500, f"prediction failed: {exc}")
