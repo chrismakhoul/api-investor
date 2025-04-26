@@ -64,7 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COOKIE      = "if_session"
+COOKIE_NAME      = "if_session"
 COOKIE_AGE  = 60 * 60 * 24 * 7    # 1 week
 
 def hash_pw(pw):      return bcrypt.hash(pw)
