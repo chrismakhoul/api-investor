@@ -76,40 +76,67 @@ async def init_db():
         await conn.run_sync(SQLModel.metadata.create_all)
 
 # ───── Auth endpoints ────────────────────────────────────────────────
+# … your imports & setup above …
+
 @app.post("/signup")
 async def signup(data: dict, s: AsyncSession = Depends(get_session)):
     email = data.get("email","").strip().lower()
     pw    = data.get("password","")
     if not email or not pw:
-        raise HTTPException(400,"email and password required")
-    if await s.exec(select(User).where(User.email==email)).first():
-        raise HTTPException(409,"email already registered")
+        raise HTTPException(400, "email and password required")
+
+    # ← fixed: use execute + scalars()
+    res = await s.execute(select(User).where(User.email == email))
+    if res.scalars().first():
+        raise HTTPException(409, "email already registered")
+
     s.add(User(email=email, password_hash=hash_pw(pw)))
     await s.commit()
-    return {"ok":True}
+    return {"ok": True}
+
 
 @app.post("/login")
 async def login(data: dict, resp: Response, s: AsyncSession = Depends(get_session)):
     email = data.get("email","").strip().lower()
     pw    = data.get("password","")
-    user  = (await s.exec(select(User).where(User.email==email))).first()
-    if not user or not verify_pw(pw,user.password_hash):
-        raise HTTPException(401,"invalid credentials")
-    resp.set_cookie(COOKIE,f"{user.id}:{user.password_hash[:10]}",
-                    max_age=COOKIE_AGE, httponly=True, samesite="lax")
-    return {"ok":True}
 
-async def current_user(req: Request, s: AsyncSession = Depends(get_session)) -> User | None:
-    raw=req.cookies.get(COOKIE)
-    if not raw or ":" not in raw: return None
-    uid,sig=raw.split(":",1)
-    u=(await s.exec(select(User).where(User.id==int(uid)))).first()
-    return u if u and u.password_hash.startswith(sig) else None
+    # ← fixed: use execute + scalars()
+    res = await s.execute(select(User).where(User.email == email))
+    user = res.scalars().first()
 
-@app.get("/me")
-async def me(u: User|None = Depends(current_user)):
-    if not u: raise HTTPException(401)
-    return {"email":u.email,"created":u.created_at}
+    if not user or not verify_pw(pw, user.password_hash):
+        raise HTTPException(401, "invalid credentials")
+
+    resp.set_cookie(
+        COOKIE_NAME,
+        f"{user.id}:{user.password_hash[:10]}",
+        max_age=COOKIE_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+    return {"ok": True}
+
+
+async def current_user(request: Request, s: AsyncSession = Depends(get_session)) -> User | None:
+    raw = request.cookies.get(COOKIE_NAME)
+    if not raw or ":" not in raw:
+        return None
+    uid, sig = raw.split(":", 1)
+
+    # ← fixed: use execute + scalars()
+    res = await s.execute(select(User).where(User.id == int(uid)))
+    user = res.scalars().first()
+
+    if user and user.password_hash.startswith(sig):
+        return user
+    return None
+
+
+@app.get("/debug/users")
+async def debug_users(session: AsyncSession = Depends(get_session)):
+    # ← fixed: use execute + scalars()
+    res = await session.execute(select(User))
+    return res.scalars().all()
 
 # ───── Prediction helpers (unchanged core logic) ─────────────────────
 def _segment(x,y,yp,eps):
