@@ -6,6 +6,7 @@ Investor-Friendly API
 • GET  /predict  ?ticker=…&algorithm=pride|gluttony
 • GET  /me       returns current user
 """
+
 from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel, Field, select
@@ -44,6 +45,12 @@ class User(SQLModel, table=True):
 
 # ───── FastAPI init ───────────────────────────────────────────────────
 app = FastAPI(title="Investor Friendly API")
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
 
 app.add_middleware(
     CORSMiddleware,
