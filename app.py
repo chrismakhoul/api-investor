@@ -1,11 +1,10 @@
 # app.py  ───────────────────────────────────────────────────────────────
 """
-Investor-Friendly API, v2
--------------------------
-• POST /signup   {email, password}
-• POST /login    {email, password}   → sets cookie
-• GET  /predict  ?ticker=...&algorithm=pride|gluttony   (unchanged)
-• GET  /me       (example protected route)
+Investor-Friendly API
+• POST /signup   {email,password}
+• POST /login    {email,password}   → cookie
+• GET  /predict  ?ticker=…&algorithm=pride|gluttony
+• GET  /me       returns current user
 """
 from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,175 +12,140 @@ from sqlmodel import SQLModel, Field, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from passlib.hash import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 from dotenv import load_dotenv
+import yfinance as yf, numpy as np, pandas as pd
+from sklearn.linear_model import LinearRegression
 
-load_dotenv(".env", override=True)  # local only
-
-# ──────────────────────────────────  DB  ──────────────────────────────
-DATABASE_URL = os.environ["DATABASE_URL"].replace(
-    "postgres://", "postgresql+asyncpg://"
+# ───── env & DB setup ─────────────────────────────────────────────────
+load_dotenv(".env", override=True)
+RAW_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = (
+    RAW_URL
+    .replace("postgres://",            "postgresql+asyncpg://")
+    .replace("postgresql://",          "postgresql+asyncpg://")
+    .replace("postgresql+psycopg2://", "postgresql+asyncpg://")
 )
+
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-async def get_session() -> AsyncSession:
-    async with SessionLocal() as session:
-        yield session
+async def get_session():  # dependency
+    async with SessionLocal() as s:
+        yield s
 
-# ───────────────────────────── Models ─────────────────────────────────
+# ───── Model ──────────────────────────────────────────────────────────
 class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    email: str = Field(index=True, unique=True)
+    email: str      = Field(index=True, unique=True)
     password_hash: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-# ──────────────────────────── FastAPI ────────────────────────────────
-app = FastAPI(title="Investor Friendly API", version="2.0")
+# ───── FastAPI init ───────────────────────────────────────────────────
+app = FastAPI(title="Investor Friendly API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:8000",      # Framer preview
-        "https://investorfriendly.fr" # your prod domain
+        "https://framer.com",           # preview iframe
+        "http://localhost:8000",
+        "https://investorfriendly.fr",  # prod domain
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-COOKIE_NAME     = "if_session"
-COOKIE_MAX_AGE  = 60 * 60 * 24 * 7      # 1 week
+COOKIE      = "if_session"
+COOKIE_AGE  = 60 * 60 * 24 * 7    # 1 week
 
-def hash_pw(pw: str) -> str:      return bcrypt.hash(pw)
-def verify_pw(pw, h) -> bool:     return bcrypt.verify(pw, h)
+def hash_pw(pw):      return bcrypt.hash(pw)
+def verify_pw(pw, h): return bcrypt.verify(pw, h)
 
-# ──────────────────────────── DB init ────────────────────────────────
 @app.on_event("startup")
-async def on_startup():
+async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-# ─────────────────────────── Signup  ─────────────────────────────────
+# ───── Auth endpoints ────────────────────────────────────────────────
 @app.post("/signup")
-async def signup(payload: dict, session: AsyncSession = Depends(get_session)):
-    email = payload.get("email", "").strip().lower()
-    pwd   = payload.get("password", "")
-    if not email or not pwd:
-        raise HTTPException(400, "email and password required")
-    # e-mail already exists?
-    if await session.exec(select(User).where(User.email == email)).first():
-        raise HTTPException(409, "email already registered")
-    user = User(email=email, password_hash=hash_pw(pwd))
-    session.add(user)
-    await session.commit()
-    return {"ok": True, "msg": "account created"}
+async def signup(data: dict, s: AsyncSession = Depends(get_session)):
+    email = data.get("email","").strip().lower()
+    pw    = data.get("password","")
+    if not email or not pw:
+        raise HTTPException(400,"email and password required")
+    if await s.exec(select(User).where(User.email==email)).first():
+        raise HTTPException(409,"email already registered")
+    s.add(User(email=email, password_hash=hash_pw(pw)))
+    await s.commit()
+    return {"ok":True}
 
-# ─────────────────────────── Login  ──────────────────────────────────
 @app.post("/login")
-async def login(payload: dict, response: Response,
-                session: AsyncSession = Depends(get_session)):
-    email = payload.get("email", "").strip().lower()
-    pwd   = payload.get("password", "")
-    user = (await session.exec(select(User).where(User.email == email))).first()
-    if not user or not verify_pw(pwd, user.password_hash):
-        raise HTTPException(401, "invalid credentials")
+async def login(data: dict, resp: Response, s: AsyncSession = Depends(get_session)):
+    email = data.get("email","").strip().lower()
+    pw    = data.get("password","")
+    user  = (await s.exec(select(User).where(User.email==email))).first()
+    if not user or not verify_pw(pw,user.password_hash):
+        raise HTTPException(401,"invalid credentials")
+    resp.set_cookie(COOKIE,f"{user.id}:{user.password_hash[:10]}",
+                    max_age=COOKIE_AGE, httponly=True, samesite="lax")
+    return {"ok":True}
 
-    cookie_val = f"{user.id}:{user.password_hash[:10]}"
-    response.set_cookie(
-        COOKIE_NAME,
-        cookie_val,
-        max_age=COOKIE_MAX_AGE,
-        httponly=True,
-        samesite="lax",
-        secure=False,        # set True if you force HTTPS
-    )
-    return {"ok": True}
-
-# ─────────────────── helper: current user from cookie ────────────────
-async def current_user(request: Request,
-                       session: AsyncSession = Depends(get_session)) -> User | None:
-    raw = request.cookies.get(COOKIE_NAME)
-    if not raw or ":" not in raw:
-        return None
-    uid, sig = raw.split(":", 1)
-    user = (await session.exec(select(User).where(User.id == int(uid)))).first()
-    if user and user.password_hash.startswith(sig):
-        return user
-    return None
+async def current_user(req: Request, s: AsyncSession = Depends(get_session)) -> User | None:
+    raw=req.cookies.get(COOKIE)
+    if not raw or ":" not in raw: return None
+    uid,sig=raw.split(":",1)
+    u=(await s.exec(select(User).where(User.id==int(uid)))).first()
+    return u if u and u.password_hash.startswith(sig) else None
 
 @app.get("/me")
-async def me(user: User = Depends(current_user)):
-    if not user:
-        raise HTTPException(401)
-    return {"email": user.email, "created_at": user.created_at}
+async def me(u: User|None = Depends(current_user)):
+    if not u: raise HTTPException(401)
+    return {"email":u.email,"created":u.created_at}
 
-# ─────────────────────────  PREDICTION CODE  ─────────────────────────
-# (unchanged from the last NaN-safe version; collapsed for brevity)
-import yfinance as yf, numpy as np, pandas as pd
-from sklearn.linear_model import LinearRegression
-
-def _segment(x,y,yh,eps):
-    diff = y - yh
-    s = np.where(diff>eps,1,np.where(diff<-eps,-1,0))
-    zc = np.where(np.diff(s)!=0)[0]
-    idx = np.concatenate(([0],zc+1,[len(diff)]))
-    seq=[]
+# ───── Prediction helpers (unchanged core logic) ─────────────────────
+def _segment(x,y,yp,eps):
+    diff=y-yp
+    s=np.where(diff>eps,1,np.where(diff<-eps,-1,0))
+    z=np.where(np.diff(s)!=0)[0]
+    idx=np.concatenate(([0],z+1,[len(diff)]))
+    out=[]
     for i in range(len(idx)-1):
-        xs = x[idx[i]:idx[i+1]].ravel()
-        ys = y[idx[i]:idx[i+1]]
-        yp = yh[idx[i]:idx[i+1]]
+        xs=x[idx[i]:idx[i+1]].ravel()
+        ys=y[idx[i]:idx[i+1]]
+        yb=yp[idx[i]:idx[i+1]]
         if xs.size<2: continue
-        area=np.trapz(ys-yp,xs)
+        area=np.trapz(ys-yb,xs)
         if abs(area)<eps: continue
-        seq.append("up" if area>0 else "down")
-    return seq
+        out.append("up" if area>0 else "down")
+    return out
 
 def _features(sym):
     close=yf.download(sym,period="max",progress=False)["Close"]
     vol=close.pct_change().rolling(5).std()
     prod=(close*vol).dropna().sort_index()
-    prod=prod[prod<6].dropna()
-    x=prod.index.map(pd.Timestamp.toordinal).values.reshape(-1,1)
-    y=prod.values
-    msk=~np.isnan(y)
-    if msk.sum()<2: raise ValueError("not enough data")
-    return x[msk].reshape(-1,1), y[msk]
+    prod=prod[prod<6]; x=prod.index.map(pd.Timestamp.toordinal).values.reshape(-1,1)
+    y=prod.values; m=~np.isnan(y); return x[m],y[m]
 
-def predict_pride(sym):
+def _predict(sym):
     x,y=_features(sym)
+    if len(y)<2: raise ValueError("not enough data")
     yh=LinearRegression().fit(x,y).predict(x)
-    seq=_segment(x,y,yh,1e-4*np.max(np.abs(y)))
-    if not seq:return{"direction":"up","probability":0.5}
-    labels=["up","down"]
-    P=np.zeros((2,2))
-    for a,b in zip(seq,seq[1:]): P[labels.index(a),labels.index(b)]+=1
+    seq=_segment(x,y,yh,1e-4*np.abs(y).max())
+    if not seq: return ("up",0.5)
+    P=np.zeros((2,2)); lab=["up","down"]
+    for a,b in zip(seq,seq[1:]): P[lab.index(a),lab.index(b)]+=1
     P=P/np.clip(P.sum(1,keepdims=True),1e-9,None)
-    p=P[labels.index(seq[-1])]
-    return{"direction":labels[int(np.argmax(p))],"probability":float(np.max(p))}
-
-def predict_gluttony(sym):
-    x,y=_features(sym)
-    yh=LinearRegression().fit(x,y).predict(x)
-    seq=_segment(x,y,yh,1e-4*np.max(np.abs(y)))
-    if not seq:return{"direction":"up","probability":0.5}
-    labels=["up","down"]
-    P=np.zeros((2,2))
-    for a,b in zip(seq,seq[1:]): P[labels.index(a),labels.index(b)]+=1
-    P=P/np.clip(P.sum(1,keepdims=True),1e-9,None)
-    p=P[labels.index(seq[-1])]
-    return{"direction":labels[int(np.argmax(p))],"probability":float(np.max(p))}
+    p=P[lab.index(seq[-1])]; return (lab[int(p.argmax())],float(p.max()))
 
 @app.get("/predict")
-async def predict(ticker: str, algorithm: str = "pride"):
-    ticker = ticker.upper()
-    algo   = algorithm.lower()
+async def predict(ticker:str, algorithm:str="pride"):
+    ticker=ticker.upper()
     try:
-        if algo=="pride":   return predict_pride(ticker)
-        if algo=="gluttony":return predict_gluttony(ticker)
-        raise HTTPException(400,f"unknown algorithm '{algorithm}'")
-    except ValueError as ve:
-        raise HTTPException(422,str(ve))
-    except Exception as exc:
-        raise HTTPException(500,f"prediction failed: {exc}")
+        dir,prob=_predict(ticker)
+        return {"direction":dir,"probability":prob}
+    except ValueError as e:
+        raise HTTPException(422,str(e))
+    except Exception as e:
+        raise HTTPException(500,f"prediction failed: {e}")
