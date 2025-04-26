@@ -4,3 +4,7 @@ yfinance
 pandas
 numpy
 scikit-learn
+sqlmodel
+asyncpg
+passlib[bcrypt]
+python-dotenv
