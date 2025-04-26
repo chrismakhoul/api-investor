@@ -1,107 +1,144 @@
-# app.py  ────────────────────────────────────────────────────────────────
+# app.py  ──────────────────────────────────────────────────────────────
+"""
+Investor-Friendly Prediction API
+--------------------------------
+GET /predict?ticker=NVDA&algorithm=gluttony
+  → {"direction": "down", "probability": 0.61}
+"""
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Core data-science libraries
+# ── Data / ML libs ────────────────────────────────────────────────────
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
-# (pip install yfinance pandas numpy scikit-learn)
 
-app = FastAPI(
-    title="Investor Friendly Prediction API",
-    version="1.0.0",
-)
+# ── FastAPI init + (open) CORS for dev ───────────────────────────────
+app = FastAPI(title="Investor Friendly API", version="1.2")
 
-# ── CORS ────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # ← during dev; restrict in production
-    allow_methods=["*"],
+    allow_origins=["*"],           
     allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────────────────────────────────
+#  Helper: robust signed-area segmentation
+# ─────────────────────────────────────────────────────────────────────
+def segment_areas(
+    x: np.ndarray,
+    y: np.ndarray,
+    y_hat: np.ndarray,
+    eps: float,
+) -> list[str]:
+    """Return sequence ['up','down', …] for consecutive signed areas."""
+    diff   = y - y_hat
+    signs  = np.where(diff > eps, 1, np.where(diff < -eps, -1, 0))
+    zc     = np.where(np.diff(signs) != 0)[0]                # zero-crossings
+    idx    = np.concatenate(([0], zc + 1, [len(diff)]))
 
-# ────────────────────────────────────────────────────────────────────────
-#  ALGORITHM – PRIDE
-#  (This is a shortened version.  Replace the “… your original logic …”
-#   sections with the full code you tested earlier.)
-# ────────────────────────────────────────────────────────────────────────
+    seq = []
+    for i in range(len(idx) - 1):
+        s, e = idx[i], idx[i + 1]
+        xs   = x[s:e].ravel()                                # 1-D
+        ys   = y[s:e]
+        yp   = y_hat[s:e]
+        if xs.size < 2:
+            continue
+        area = float(np.trapz(ys - yp, xs))
+        if abs(area) < eps:
+            continue
+        seq.append("up" if area > 0 else "down")
+    return seq
+
+# ─────────────────────────────────────────────────────────────────────
+#  PRIDE  – full original logic (simplified comments)
+# ─────────────────────────────────────────────────────────────────────
 def predict_pride(symbol: str) -> dict[str, float | str]:
-    # 1) download full history (max ~20 yrs)
-    df_close = yf.download(symbol, period="max", progress=False)["Close"]
+    close = yf.download(symbol, period="max", progress=False)["Close"]
 
-    # 2) calculate price × volatility product (your steps)
-    returns = df_close.pct_change()
-    vol = returns.rolling(5).std()
-    product = (df_close * vol).dropna().sort_index()
+    # feature: price × rolling volatility
+    ret = close.pct_change()
+    vol = ret.rolling(5).std()
+    prod = (close * vol).dropna().sort_index()
 
-    # 3) line of best fit
-    x = product.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
-    y = product.values
+    # exclude extreme spikes (>= 6) like original code
+    threshold = 6
+    mask = prod < threshold
+    prod = prod[mask]
+
+    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+    y = prod.values
     model = LinearRegression().fit(x, y)
+    y_pred = model.predict(x)
 
-    # 4) your existing *area between curves* + Markov logic
-    #    ----------------------------------------------------------------
-    #    Keep the exact code you had.  It should ultimately set:
-    #         direction  = "up" | "down"
-    #         probability = float, between 0 and 1
-    #    ----------------------------------------------------------------
-    # ↓↓↓  PLACEHOLDER so the code runs – replace with real logic ↓↓↓
-    direction = "up"
-    probability = 0.65
-    # ↑↑↑  ----------------------------------------------------------------
+    eps  = 1e-4 * np.max(np.abs(y))
+    seq  = segment_areas(x, y, y_pred, eps)
+
+    # first-order Markov chain in two states: up / down
+    labels = ["up", "down"]
+    P = np.zeros((2, 2))
+    for a, b in zip(seq, seq[1:]):
+        P[labels.index(a), labels.index(b)] += 1
+    rowsum = P.sum(axis=1, keepdims=True)
+    P = np.divide(P, rowsum, where=rowsum != 0)
+
+    if not seq:                           # back-stop: no segments
+        return {"direction": "up", "probability": 0.5}
+
+    current_idx = labels.index(seq[-1])
+    probs       = P[current_idx]
+    direction   = labels[int(np.argmax(probs))]
+    probability = float(np.max(probs)) if probs.sum() else 0.5
 
     return {"direction": direction, "probability": probability}
 
-
-# ────────────────────────────────────────────────────────────────────────
-#  ALGORITHM – GLUTTONY  (same idea, but thresholds / bins differ)
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  GLUTTONY – same feature-set, but decision via up-ratio
+# ─────────────────────────────────────────────────────────────────────
 def predict_gluttony(symbol: str) -> dict[str, float | str]:
-    df_close = yf.download(symbol, period="max", progress=False)["Close"]
+    close = yf.download(symbol, period="max", progress=False)["Close"]
 
-    # 1) build features
-    returns = df_close.pct_change()
-    vol = returns.rolling(5).std()
-    product = (df_close * vol).dropna().sort_index()
+    ret = close.pct_change()
+    vol = ret.rolling(5).std()
+    prod = (close * vol).dropna().sort_index()
 
-    # 2) linear fit
-    x = product.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
-    y = product.values
+    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+    y = prod.values
     model = LinearRegression().fit(x, y)
+    y_pred = model.predict(x)
 
-    # 3) your Gluttony-specific Markov logic
-    # ↓↓↓  PLACEHOLDER ↓↓↓
-    direction = "down"
-    probability = 0.58
-    # ↑↑↑  Replace with full implementation ↑↑↑
+    eps  = 1e-4 * np.max(np.abs(y))
+    seq  = segment_areas(x, y, y_pred, eps)
 
+    if not seq:
+        return {"direction": "up", "probability": 0.5}
+
+    up_ratio   = seq.count("up") / len(seq)
+    direction  = "up" if up_ratio >= 0.5 else "down"
+    probability = up_ratio if direction == "up" else 1 - up_ratio
     return {"direction": direction, "probability": probability}
 
-
-# ────────────────────────────────────────────────────────────────────────
-#  ENDPOINT – recomputed on every request (fresh data every day)
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  Single endpoint
+# ─────────────────────────────────────────────────────────────────────
 @app.get("/predict")
 async def predict(ticker: str, algorithm: str = "pride"):
     """
-    Query  
-        /predict?ticker=AAPL&algorithm=pride
-
-    Returns  
-        { "direction": "up", "probability": 0.83 }
+    Example:
+      /predict?ticker=TSLA&algorithm=gluttony
     """
     ticker = ticker.upper()
+    algo   = algorithm.lower()
 
     try:
-        match algorithm.lower():
-            case "pride":
-                return predict_pride(ticker)
-            case "gluttony":
-                return predict_gluttony(ticker)
-            case _:
-                raise HTTPException(400, f"Unknown algorithm '{algorithm}'")
+        if algo == "pride":
+            return predict_pride(ticker)
+        elif algo == "gluttony":
+            return predict_gluttony(ticker)
+        else:
+            raise HTTPException(400, f"Unknown algorithm '{algorithm}'")
     except Exception as exc:
         raise HTTPException(500, f"prediction failed: {exc}")
