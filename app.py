@@ -1,185 +1,152 @@
-# app.py  ───────────────────────────────────────────────────────────────
+# app.py  ─────────────────────────────────────────────────────────────
 """
-Investor-Friendly API
-• POST /signup   {email,password}
-• POST /login    {email,password}   → cookie
-• GET  /predict  ?ticker=…&algorithm=pride|gluttony
-• GET  /me       returns current user
+Investor-Friendly Prediction API
+--------------------------------
+GET /predict?ticker=AAPL&algorithm=pride
+   → {"direction": "up", "probability": 0.77}
 """
-
-from fastapi import FastAPI, HTTPException, Depends, Response, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Field, select
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from passlib.hash import bcrypt
-from datetime import datetime
-import os
-from dotenv import load_dotenv
-import yfinance as yf, numpy as np, pandas as pd
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
 from sklearn.linear_model import LinearRegression
 
-# ───── env & DB setup ─────────────────────────────────────────────────
-load_dotenv(".env", override=True)
-RAW_URL = os.environ["DATABASE_URL"]
-DATABASE_URL = (
-    RAW_URL
-    .replace("postgres://",            "postgresql+asyncpg://")
-    .replace("postgresql://",          "postgresql+asyncpg://")
-    .replace("postgresql+psycopg2://", "postgresql+asyncpg://")
-)
+app = FastAPI(title="Investor Friendly API", version="1.3")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-async def get_session():  # dependency
-    async with SessionLocal() as s:
-        yield s
-
-# ───── Model ──────────────────────────────────────────────────────────
-class User(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    email: str      = Field(index=True, unique=True)
-    password_hash: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-# ───── FastAPI init ───────────────────────────────────────────────────
-app = FastAPI(title="Investor Friendly API")
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-
+# ── CORS (open during dev, restrict later) ───────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://framer.com",           # preview iframe
-        "http://localhost:8000",
-        "https://investorfriendly.fr",  # prod domain
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],            # replace with your Framer URL in prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-COOKIE_NAME      = "if_session"
-COOKIE_AGE  = 60 * 60 * 24 * 7    # 1 week
+# ─────────────────────────────────────────────────────────────────────
+#  Helper: signed-area segmentation (NaN-safe)
+# ─────────────────────────────────────────────────────────────────────
+def segment_areas(
+    x: np.ndarray,
+    y: np.ndarray,
+    y_hat: np.ndarray,
+    eps: float,
+) -> list[str]:
+    """Return state sequence ['up','down', …] with NaNs already removed."""
+    diff  = y - y_hat
+    signs = np.where(diff > eps, 1, np.where(diff < -eps, -1, 0))
+    zc    = np.where(np.diff(signs) != 0)[0]
+    idx   = np.concatenate(([0], zc + 1, [len(diff)]))
 
-def hash_pw(pw):      return bcrypt.hash(pw)
-def verify_pw(pw, h): return bcrypt.verify(pw, h)
+    seq = []
+    for i in range(len(idx) - 1):
+        s, e = idx[i], idx[i + 1]
+        xs, ys, yp = x[s:e].ravel(), y[s:e], y_hat[s:e]
+        if xs.size < 2:
+            continue
+        area = float(np.trapz(ys - yp, xs))
+        if abs(area) < eps:
+            continue
+        seq.append("up" if area > 0 else "down")
+    return seq
 
-@app.on_event("startup")
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+# ─────────────────────────────────────────────────────────────────────
+#  Core routine shared by both algorithms
+# ─────────────────────────────────────────────────────────────────────
+def build_features(symbol: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return (x, y) arrays with all NaNs removed."""
+    close = yf.download(symbol, period="max", progress=False)["Close"]
 
-# ───── Auth endpoints ────────────────────────────────────────────────
-# … your imports & setup above …
+    returns = close.pct_change()
+    vol     = returns.rolling(5).std()
+    prod    = (close * vol).dropna().sort_index()
 
-@app.post("/signup")
-async def signup(data: dict, s: AsyncSession = Depends(get_session)):
-    email = data.get("email","").strip().lower()
-    pw    = data.get("password","")
-    if not email or not pw:
-        raise HTTPException(400, "email and password required")
+    # (optional) cap outliers like original code
+    prod = prod[prod < 6]
 
-    # ← fixed: use execute + scalars()
-    res = await s.execute(select(User).where(User.email == email))
-    if res.scalars().first():
-        raise HTTPException(409, "email already registered")
+    # remove any remaining NaNs (rare but safe)
+    prod = prod.dropna()
+    if prod.empty:
+        raise ValueError("Not enough valid data after cleaning")
 
-    s.add(User(email=email, password_hash=hash_pw(pw)))
-    await s.commit()
-    return {"ok": True}
+    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
+    y = prod.values
 
+    mask = ~np.isnan(y)
+    if mask.sum() < 2:
+        raise ValueError("Insufficient non-NaN points")
 
-@app.post("/login")
-async def login(data: dict, resp: Response, s: AsyncSession = Depends(get_session)):
-    email = data.get("email","").strip().lower()
-    pw    = data.get("password","")
+    # ⬇︎  ensure X stays 2-D after masking
+    x_final = x[mask].reshape(-1, 1)   # <── added .reshape
+    y_final = y[mask]
 
-    # ← fixed: use execute + scalars()
-    res = await s.execute(select(User).where(User.email == email))
-    user = res.scalars().first()
+    return x_final, y_final
 
-    if not user or not verify_pw(pw, user.password_hash):
-        raise HTTPException(401, "invalid credentials")
+# ─────────────────────────────────────────────────────────────────────
+#  PRIDE
+# ─────────────────────────────────────────────────────────────────────
+def predict_pride(symbol: str) -> dict[str, float | str]:
+    x, y = build_features(symbol)
 
-    resp.set_cookie(
-        COOKIE_NAME,
-        f"{user.id}:{user.password_hash[:10]}",
-        max_age=COOKIE_AGE,
-        httponly=True,
-        samesite="lax",
-    )
-    return {"ok": True}
+    model  = LinearRegression().fit(x, y)
+    y_hat  = model.predict(x)
+    eps    = 1e-4 * np.max(np.abs(y))
+    seq    = segment_areas(x, y, y_hat, eps)
 
+    if not seq:
+        return {"direction": "up", "probability": 0.5}
 
-async def current_user(request: Request, s: AsyncSession = Depends(get_session)) -> User | None:
-    raw = request.cookies.get(COOKIE_NAME)
-    if not raw or ":" not in raw:
-        return None
-    uid, sig = raw.split(":", 1)
+    labels = ["up", "down"]
+    P = np.zeros((2, 2))
+    for a, b in zip(seq, seq[1:]):
+        P[labels.index(a), labels.index(b)] += 1
+    row_sum = P.sum(axis=1, keepdims=True)
+    P = np.divide(P, row_sum, where=row_sum != 0)
 
-    # ← fixed: use execute + scalars()
-    res = await s.execute(select(User).where(User.id == int(uid)))
-    user = res.scalars().first()
+    current = labels.index(seq[-1])
+    probs   = P[current]
+    direction   = labels[int(np.argmax(probs))]
+    probability = float(np.max(probs)) if probs.sum() else 0.5
+    return {"direction": direction, "probability": probability}
 
-    if user and user.password_hash.startswith(sig):
-        return user
-    return None
+# ─────────────────────────────────────────────────────────────────────
+#  GLUTTONY
+# ─────────────────────────────────────────────────────────────────────
+def predict_gluttony(symbol: str) -> dict[str, float | str]:
+    x, y = build_features(symbol)
 
+    model  = LinearRegression().fit(x, y)
+    y_hat  = model.predict(x)
+    eps    = 1e-4 * np.max(np.abs(y))
+    seq    = segment_areas(x, y, y_hat, eps)
 
-@app.get("/debug/users")
-async def debug_users(session: AsyncSession = Depends(get_session)):
-    # ← fixed: use execute + scalars()
-    res = await session.execute(select(User))
-    return res.scalars().all()
+    if not seq:
+        return {"direction": "up", "probability": 0.5}
 
-# ───── Prediction helpers (unchanged core logic) ─────────────────────
-def _segment(x,y,yp,eps):
-    diff=y-yp
-    s=np.where(diff>eps,1,np.where(diff<-eps,-1,0))
-    z=np.where(np.diff(s)!=0)[0]
-    idx=np.concatenate(([0],z+1,[len(diff)]))
-    out=[]
-    for i in range(len(idx)-1):
-        xs=x[idx[i]:idx[i+1]].ravel()
-        ys=y[idx[i]:idx[i+1]]
-        yb=yp[idx[i]:idx[i+1]]
-        if xs.size<2: continue
-        area=np.trapz(ys-yb,xs)
-        if abs(area)<eps: continue
-        out.append("up" if area>0 else "down")
-    return out
+    up_ratio   = seq.count("up") / len(seq)
+    direction  = "up" if up_ratio >= 0.5 else "down"
+    probability = up_ratio if direction == "up" else 1 - up_ratio
+    return {"direction": direction, "probability": probability}
 
-def _features(sym):
-    close=yf.download(sym,period="max",progress=False)["Close"]
-    vol=close.pct_change().rolling(5).std()
-    prod=(close*vol).dropna().sort_index()
-    prod=prod[prod<6]; x=prod.index.map(pd.Timestamp.toordinal).values.reshape(-1,1)
-    y=prod.values; m=~np.isnan(y); return x[m],y[m]
-
-def _predict(sym):
-    x,y=_features(sym)
-    if len(y)<2: raise ValueError("not enough data")
-    yh=LinearRegression().fit(x,y).predict(x)
-    seq=_segment(x,y,yh,1e-4*np.abs(y).max())
-    if not seq: return ("up",0.5)
-    P=np.zeros((2,2)); lab=["up","down"]
-    for a,b in zip(seq,seq[1:]): P[lab.index(a),lab.index(b)]+=1
-    P=P/np.clip(P.sum(1,keepdims=True),1e-9,None)
-    p=P[lab.index(seq[-1])]; return (lab[int(p.argmax())],float(p.max()))
-
+# ─────────────────────────────────────────────────────────────────────
+#  Endpoint – fresh computation every call
+# ─────────────────────────────────────────────────────────────────────
 @app.get("/predict")
-async def predict(ticker:str, algorithm:str="pride"):
-    ticker=ticker.upper()
+async def predict(ticker: str, algorithm: str = "pride"):
+    """
+    /predict?ticker=TSLA&algorithm=gluttony
+    """
+    ticker = ticker.upper()
+    algo   = algorithm.lower()
+
     try:
-        dir,prob=_predict(ticker)
-        return {"direction":dir,"probability":prob}
-    except ValueError as e:
-        raise HTTPException(422,str(e))
-    except Exception as e:
-        raise HTTPException(500,f"prediction failed: {e}")
+        if algo == "pride":
+            return predict_pride(ticker)
+        elif algo == "gluttony":
+            return predict_gluttony(ticker)
+        else:
+            raise HTTPException(400, f"Unknown algorithm '{algorithm}'")
+    except ValueError as ve:
+        raise HTTPException(422, str(ve))
+    except Exception as exc:
+        raise HTTPException(500, f"prediction failed: {exc}")
