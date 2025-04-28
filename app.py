@@ -1,4 +1,3 @@
-# app.py  ─────────────────────────────────────────────────────────────
 """
 Investor-Friendly Prediction API
 --------------------------------
@@ -150,3 +149,109 @@ async def predict(ticker: str, algorithm: str = "pride"):
         raise HTTPException(422, str(ve))
     except Exception as exc:
         raise HTTPException(500, f"prediction failed: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────
+#  Authentication: Signup, Login & “/users/me”
+#  (appended – do NOT change anything above!)
+# ─────────────────────────────────────────────────────────────────────
+
+import os
+from datetime import datetime, timedelta
+
+from sqlalchemy import Column, Integer, String, DateTime, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import bcrypt
+from jose import JWTError, jwt
+from fastapi import Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+
+# Load your env vars (Render will inject DATABASE_URL & JWT_SECRET)
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET   = os.getenv("JWT_SECRET")
+
+# SQLAlchemy setup
+engine       = create_engine(DATABASE_URL, echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base         = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id              = Column(Integer, primary_key=True, index=True)
+    email           = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+# Create the users table if it doesn't exist
+Base.metadata.create_all(bind=engine)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_password_hash(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+
+def authenticate_user(db: Session, email: str, password: str):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+@app.post("/signup")
+def signup(email: str, password: str, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed = get_password_hash(password)
+    user   = User(email=email, hashed_password=hashed)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"id": user.id, "email": user.email}
+
+@app.post("/token")
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    expire       = datetime.utcnow() + timedelta(days=7)
+    access_token = jwt.encode({"sub": str(user.id), "exp": expire}, JWT_SECRET, algorithm="HS256")
+    return {"access_token": access_token, "token_type": "bearer"}
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = int(payload.get("sub"))
+    except (JWTError, TypeError, ValueError):
+        raise credentials_exception
+    user = db.get(User, user_id)
+    if not user:
+        raise credentials_exception
+    return user
+
+@app.get("/users/me")
+def read_users_me(current_user: User = Depends(get_current_user)):
+    return {"id": current_user.id, "email": current_user.email}
