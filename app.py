@@ -206,16 +206,37 @@ def authenticate_user(db: Session, email: str, password: str):
         return None
     return user
 
+from pydantic import BaseModel, EmailStr
+
+# Pydantic model for signup request
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+
 @app.post("/signup")
-def signup(email: str, password: str, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == email).first():
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    """
+    Expects JSON body:
+      { "email": "you@example.com", "password": "secret" }
+    """
+    # extract fields
+    email = request.email
+    password = request.password
+
+    # check for existing user
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    # hash the password and save new user
     hashed = get_password_hash(password)
     user   = User(email=email, hashed_password=hashed)
     db.add(user)
     db.commit()
     db.refresh(user)
+
     return {"id": user.id, "email": user.email}
+
 
 @app.post("/token")
 def login_for_access_token(
