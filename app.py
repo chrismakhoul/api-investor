@@ -176,7 +176,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base         = declarative_base()
 
 class User(Base):
-    _tablename_ = "users"
+    __tablename__ = "users"
     id              = Column(Integer, primary_key=True, index=True)
     email           = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
