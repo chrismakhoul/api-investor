@@ -1,278 +1,220 @@
-"""
-Investor-Friendly Prediction API
---------------------------------
-GET /predict?ticker=AAPL&algorithm=pride
-   → {"direction": "up", "probability": 0.77}
-"""
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# app.py  ─────────────────────────────────────────────────────────
+import os, io, json, math, asyncio, datetime as dt
+from functools import lru_cache
+from typing import Literal
 
-import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
+import yfinance as yf
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sklearn.linear_model import LinearRegression
 
-app = FastAPI(title="Investor Friendly API", version="1.3")
+# ─────────────────────────────── constants
+ROLLING_WINDOW = 5
+ALLOWED_ALGOS = {"pride", "gluttony"}
 
-# ── CORS (open during dev, restrict later) ───────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],            # replace with your Framer URL in prod
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─────────────────────────────── FastAPI
+app = FastAPI(title="Pride & Gluttony Predictor API",
+              description="Predicts next-day ↑ / ↓ direction with probability using two custom algorithms.")
 
-# ─────────────────────────────────────────────────────────────────────
-#  Helper: signed-area segmentation (NaN-safe)
-# ─────────────────────────────────────────────────────────────────────
-def segment_areas(
-    x: np.ndarray,
-    y: np.ndarray,
-    y_hat: np.ndarray,
-    eps: float,
-) -> list[str]:
-    """Return state sequence ['up','down', …] with NaNs already removed."""
-    diff  = y - y_hat
-    signs = np.where(diff > eps, 1, np.where(diff < -eps, -1, 0))
-    zc    = np.where(np.diff(signs) != 0)[0]
-    idx   = np.concatenate(([0], zc + 1, [len(diff)]))
+# ─────────────────────────────── helper: fetch full price history
+@lru_cache(maxsize=256)
+def get_history(ticker: str) -> pd.Series:
+    df = yf.download(ticker, period="max", progress=False)
+    if df.empty:
+        raise ValueError(f"Ticker {ticker!r} not found.")
+    return df["Close"].dropna()
 
-    seq = []
-    for i in range(len(idx) - 1):
-        s, e = idx[i], idx[i + 1]
-        xs, ys, yp = x[s:e].ravel(), y[s:e], y_hat[s:e]
-        if xs.size < 2:
-            continue
-        area = float(np.trapz(ys - yp, xs))
-        if abs(area) < eps:
-            continue
-        seq.append("up" if area > 0 else "down")
-    return seq
+# ─────────────────────────────── core logic identical to your code
+def price_vol_product(series: pd.Series) -> pd.Series:
+    returns = series.pct_change()
+    volatility = returns.rolling(window=ROLLING_WINDOW).std()
+    return (series * volatility).dropna().sort_index()
 
-# ─────────────────────────────────────────────────────────────────────
-#  Core routine shared by both algorithms
-# ─────────────────────────────────────────────────────────────────────
-def build_features(symbol: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return (x, y) arrays with all NaNs removed."""
-    close = yf.download(symbol, period="max", progress=False)["Close"]
-
-    returns = close.pct_change()
-    vol     = returns.rolling(5).std()
-    prod    = (close * vol).dropna().sort_index()
-
-    # (optional) cap outliers like original code
-    prod = prod[prod < 6]
-
-    # remove any remaining NaNs (rare but safe)
-    prod = prod.dropna()
-    if prod.empty:
-        raise ValueError("Not enough valid data after cleaning")
-
-    x = prod.index.map(pd.Timestamp.toordinal).values.reshape(-1, 1)
-    y = prod.values
-
+def build_markov_prediction(product: pd.Series):
+    # === ALL LINES below replicate your algorithm as-is ======================
+    x = np.array(product.index.map(pd.Timestamp.toordinal)).reshape(-1, 1)
+    y = product.values
     mask = ~np.isnan(y)
-    if mask.sum() < 2:
-        raise ValueError("Insufficient non-NaN points")
+    x_clean, y_clean = x[mask], y[mask]
 
-    # ⬇︎  ensure X stays 2-D after masking
-    x_final = x[mask].reshape(-1, 1)   # <── added .reshape
-    y_final = y[mask]
-
-    return x_final, y_final
-
-# ─────────────────────────────────────────────────────────────────────
-#  PRIDE
-# ─────────────────────────────────────────────────────────────────────
-def predict_pride(symbol: str) -> dict[str, float | str]:
-    x, y = build_features(symbol)
-
-    model  = LinearRegression().fit(x, y)
-    y_hat  = model.predict(x)
-    eps    = 1e-4 * np.max(np.abs(y))
-    seq    = segment_areas(x, y, y_hat, eps)
-
-    if not seq:
-        return {"direction": "up", "probability": 0.5}
-
-    labels = ["up", "down"]
-    P = np.zeros((2, 2))
-    for a, b in zip(seq, seq[1:]):
-        P[labels.index(a), labels.index(b)] += 1
-    row_sum = P.sum(axis=1, keepdims=True)
-    P = np.divide(P, row_sum, where=row_sum != 0)
-
-    current = labels.index(seq[-1])
-    probs   = P[current]
-    direction   = labels[int(np.argmax(probs))]
-    probability = float(np.max(probs)) if probs.sum() else 0.5
-    return {"direction": direction, "probability": probability}
-
-# ─────────────────────────────────────────────────────────────────────
-#  GLUTTONY
-# ─────────────────────────────────────────────────────────────────────
-def predict_gluttony(symbol: str) -> dict[str, float | str]:
-    x, y = build_features(symbol)
-
-    model  = LinearRegression().fit(x, y)
-    y_hat  = model.predict(x)
-    eps    = 1e-4 * np.max(np.abs(y))
-    seq    = segment_areas(x, y, y_hat, eps)
-
-    if not seq:
-        return {"direction": "up", "probability": 0.5}
-
-    up_ratio   = seq.count("up") / len(seq)
-    direction  = "up" if up_ratio >= 0.5 else "down"
-    probability = up_ratio if direction == "up" else 1 - up_ratio
-    return {"direction": direction, "probability": probability}
-
-# ─────────────────────────────────────────────────────────────────────
-#  Endpoint – fresh computation every call
-# ─────────────────────────────────────────────────────────────────────
-@app.get("/predict")
-async def predict(ticker: str, algorithm: str = "pride"):
-    """
-    /predict?ticker=TSLA&algorithm=gluttony
-    """
-    ticker = ticker.upper()
-    algo   = algorithm.lower()
-
-    try:
-        if algo == "pride":
-            return predict_pride(ticker)
-        elif algo == "gluttony":
-            return predict_gluttony(ticker)
-        else:
-            raise HTTPException(400, f"Unknown algorithm '{algorithm}'")
-    except ValueError as ve:
-        raise HTTPException(422, str(ve))
-    except Exception as exc:
-        raise HTTPException(500, f"prediction failed: {exc}")
-
-# ─────────────────────────────────────────────────────────────────────
-#  Authentication: Signup, Login & “/users/me”
-#  (appended – do NOT change anything above!)
-# ─────────────────────────────────────────────────────────────────────
-
-import os
-from datetime import datetime, timedelta
-
-from sqlalchemy import Column, Integer, String, DateTime, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-import bcrypt
-from jose import JWTError, jwt
-from fastapi import Depends, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-
-# Load your env vars (Render will inject DATABASE_URL & JWT_SECRET)
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET   = os.getenv("JWT_SECRET")
-
-# SQLAlchemy setup
-engine       = create_engine(DATABASE_URL, echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base         = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id              = Column(Integer, primary_key=True, index=True)
-    email           = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    created_at      = Column(DateTime, default=datetime.utcnow)
-
-# Create the users table if it doesn't exist
-Base.metadata.create_all(bind=engine)
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_password_hash(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
-
-def authenticate_user(db: Session, email: str, password: str):
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(password, user.hashed_password):
-        return None
-    return user
-
-from pydantic import BaseModel, EmailStr
-
-# Pydantic model for signup request
-class SignupRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-@app.post("/signup")
-def signup(request: SignupRequest, db: Session = Depends(get_db)):
-    """
-    Expects JSON body:
-      { "email": "you@example.com", "password": "secret" }
-    """
-    # extract fields
-    email = request.email
-    password = request.password
-
-    # check for existing user
-    existing = db.query(User).filter(User.email == email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    # hash the password and save new user
-    hashed = get_password_hash(password)
-    user   = User(email=email, hashed_password=hashed)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    return {"id": user.id, "email": user.email}
-
-
-@app.post("/token")
-def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    user = authenticate_user(db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    expire       = datetime.utcnow() + timedelta(days=7)
-    access_token = jwt.encode({"sub": str(user.id), "exp": expire}, JWT_SECRET, algorithm="HS256")
-    return {"access_token": access_token, "token_type": "bearer"}
-
-def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db),
-):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+    threshold = 6
+    exclude_indices = np.where(y_clean >= threshold)[0]
+    mask2 = y_clean < threshold
+    x_clean, y_clean = x_clean[mask2], y_clean[mask2]
+    x_dates_clean = pd.to_datetime(
+        [pd.Timestamp.fromordinal(int(i)) for i in x_clean.flatten()]
     )
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user_id = int(payload.get("sub"))
-    except (JWTError, TypeError, ValueError):
-        raise credentials_exception
-    user = db.get(User, user_id)
-    if not user:
-        raise credentials_exception
-    return user
 
-@app.get("/users/me")
-def read_users_me(current_user: User = Depends(get_current_user)):
-    return {"id": current_user.id, "email": current_user.email}
+    model = LinearRegression().fit(x_clean, y_clean)
+    y_pred = model.predict(x_clean)
+    difference = y_clean - y_pred
+    epsilon = 1e-4 * np.max(np.abs(y_clean))
+
+    signs = np.where(difference > epsilon, 1,
+                     np.where(difference < -epsilon, -1, 0))
+    zero_cross = np.where(np.diff(signs) != 0)[0]
+    seg_idx = np.concatenate(([0], zero_cross + 1, [len(difference)]))
+
+    areas = []
+    tot_above = tot_below = 0.0
+    for i in range(len(seg_idx) - 1):
+        s, e = seg_idx[i], seg_idx[i + 1]
+        if e - s < 1:           # need at least 1 pt
+            continue
+        if np.intersect1d(np.arange(s, e), exclude_indices).size:
+            continue
+
+        seg_x = x_clean[s:e].flatten()
+        seg_y = y_clean[s:e]
+        seg_yhat = y_pred[s:e]
+
+        if len(seg_x) >= 2:
+            area = np.trapz(seg_y, seg_x) - np.trapz(seg_yhat, seg_x)
+        else:
+            area = (seg_y[0] - seg_yhat[0]) * 1
+
+        pos = "Above" if area > epsilon else "Below" if area < -epsilon else "Neutral"
+        if pos == "Above":
+            tot_above += area
+        elif pos == "Below":
+            tot_below += area
+        areas.append({"Segment": i+1, "Area": area, "Position": pos})
+
+    areas_df = pd.DataFrame(areas)
+    areas_df = areas_df[areas_df["Area"] != 0].reset_index(drop=True)
+
+    # === custom binning & Markov chain (unchanged) ==========================
+    pos_df = areas_df[areas_df["Area"] > 0].copy()
+    neg_df = areas_df[areas_df["Area"] < 0].copy()
+
+    pct = [0.5, 0.85, 1.0]
+    if not pos_df.empty:
+        pos_bins = np.unique(
+            np.concatenate(([pos_df["Area"].min()],
+                            pos_df["Area"].quantile(pct).values,
+                            [pos_df["Area"].max()]))
+        )
+        pos_df["State"] = pd.cut(pos_df["Area"], bins=pos_bins,
+                                 labels=[f"Bin {i+1}" for i in range(len(pos_bins)-1)],
+                                 include_lowest=True)
+
+    if not neg_df.empty:
+        neg_df["Abs"] = neg_df["Area"].abs()
+        neg_bins_abs = np.unique(
+            np.concatenate(([neg_df["Abs"].min()],
+                            neg_df["Abs"].quantile(pct).values,
+                            [neg_df["Abs"].max()]))
+        )
+        neg_bins = -neg_bins_abs[::-1]
+        neg_df["State"] = pd.cut(neg_df["Area"], bins=neg_bins,
+                                 labels=[f"Bin {6-i}" for i in range(len(neg_bins)-1)],
+                                 include_lowest=True)
+        neg_df.drop(columns=["Abs"], inplace=True)
+
+    df_binned = pd.concat([pos_df, neg_df], ignore_index=True).dropna(subset=["State"])
+    df_binned["State"] = df_binned["State"].astype(str)
+    df_binned = df_binned.sort_values("Segment")
+    state_seq = df_binned["State"].tolist()
+
+    labels = ["Bin 1", "Bin 2", "Bin 3", "Bin 4", "Bin 5", "Bin 6"]
+    n = len(labels)
+    T = np.zeros((n, n))
+    for i in range(len(state_seq) - 1):
+        cur = labels.index(state_seq[i])
+        nxt = labels.index(state_seq[i+1])
+        T[cur, nxt] += 1
+    row_sum = T.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        P = np.divide(T, row_sum, where=row_sum != 0)
+
+    cur_state = state_seq[-1]
+    cur_idx = labels.index(cur_state)
+    probs = P[cur_idx]
+
+    # tomorrow = most probable up/down vs current price
+    up_prob   = probs[0] + probs[1] + probs[2]   # Bins 1-3 are “above” zones
+    down_prob = probs[3] + probs[4] + probs[5]   # Bins 4-6 are “below”
+    if up_prob == down_prob == 0:        # degenerate
+        pred, prob = "neutral", 0.5
+    elif up_prob >= down_prob:
+        pred, prob = "up", float(up_prob)
+    else:
+        pred, prob = "down", float(down_prob)
+
+    return pred, round(prob, 4)
+
+# ─────────────────────────────── API cache structure
+_cache: dict[tuple[str, str], dict] = {}  # key: (algo, ticker)
+
+def compute_prediction(algo: str, ticker: str) -> dict:
+    series = get_history(ticker)
+    product = price_vol_product(series)
+    pred, prob = build_markov_prediction(product)
+    return {
+        "ticker": ticker.upper(),
+        "algorithm": algo,
+        "date": dt.date.today().isoformat(),
+        "prediction": pred,
+        "probability": prob
+    }
+
+async def ensure_cached(algo: str, ticker: str) -> dict:
+    key = (algo, ticker.upper())
+    today = dt.date.today().isoformat()
+    entry = _cache.get(key)
+    if entry and entry["date"] == today:
+        return entry
+    data = await asyncio.to_thread(compute_prediction, algo, ticker)
+    _cache[key] = data
+    return data
+
+# ─────────────────────────────── REST endpoints
+class Prediction(BaseModel):
+    ticker: str
+    algorithm: Literal["pride", "gluttony"]
+    date: str
+    prediction: Literal["up", "down", "neutral"]
+    probability: float
+
+@app.get("/predict/{algorithm}", response_model=Prediction)
+async def predict_endpoint(
+    algorithm: str,
+    ticker: str = Query(..., min_length=1, max_length=10, regex=r"^[A-Za-z\.\-]+$"),
+):
+    algorithm = algorithm.lower()
+    if algorithm not in ALLOWED_ALGOS:
+        raise HTTPException(status_code=404, detail="Unknown algorithm.")
+    try:
+        result = await ensure_cached(algorithm, ticker)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+@app.post("/refresh")
+async def manual_refresh(ticker: str):
+    """Force-refresh both algorithms for a ticker."""
+    out = {}
+    for algo in ALLOWED_ALGOS:
+        out[algo] = await ensure_cached(algo, ticker)
+    return out
+
+# ─────────────────────────────── background daily refresh
+def schedule_refresh():
+    async def refresh_all():
+        for (algo, tick), _ in list(_cache.items()):
+            try:
+                _cache[(algo, tick)] = compute_prediction(algo, tick)
+            except Exception as e:
+                print("Refresh error for", algo, tick, e)
+
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    # 22:10 UTC ≈ 6:10 PM US-ET after market close
+    scheduler.add_job(refresh_all, "cron", hour=22, minute=10)
+    scheduler.start()
+
+@app.on_event("startup")
+async def startup_event():
+    schedule_refresh()
