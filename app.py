@@ -40,7 +40,8 @@ app = FastAPI(title="Pride & Gluttony API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://investorfriendly.fr"],  # or ["*"] for testing
+    allow_origins=["https://investorfriendly.fr"],   # your Framer-hosted domain
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
