@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sklearn.linear_model import LinearRegression
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi.middleware.cors import CORSMiddleware
 
 ROLL = 5                      # rolling window for volatility
 ALGORITHMS = {"pride", "gluttony"}
@@ -36,6 +37,13 @@ MONTE_CARLO_SIMULATIONS = 10   # keep notebook default (10 × 5‑step paths)
 MC_STEPS = 5
 
 app = FastAPI(title="Pride & Gluttony API", version="4.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://investorfriendly.fr"],  # or ["*"] for testing
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # ─────────────────────────── Yahoo helper ─────────────────────────
 
